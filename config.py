@@ -52,5 +52,59 @@ SMTP_PORT            = 465
 TRADE_DB_PATH        = "storage/trades.db"
 LOGS_DIR             = "logs"
 
+# ── Strategy selection ────────────────────────────────────────────────────────
+ACTIVE_STRATEGIES    = ["ema_vwap_rsi"]   # strategies that run in paper/live mode
+
+STRATEGY_PARAMS = {
+    "ema_vwap_rsi": {
+        "ema_fast":          EMA_FAST,
+        "ema_slow":          EMA_SLOW,
+        "rsi_period":        RSI_PERIOD,
+        "volume_period":     VOLUME_PERIOD,
+        "volume_multiplier": VOLUME_MULTIPLIER,
+        "rsi_long_low":      RSI_LONG_LOW,
+        "rsi_long_high":     RSI_LONG_HIGH,
+        "rsi_short_low":     RSI_SHORT_LOW,
+        "rsi_short_high":    RSI_SHORT_HIGH,
+        "min_rr_ratio":      MIN_RR_RATIO,
+    },
+    "orb": {
+        "orb_minutes":   30,     # minutes after 09:15 that define the opening range
+        "gap_min":       0.003,  # minimum gap % vs prev close to trade ORB
+        "rvol_min":      1.3,    # minimum relative volume at OR completion
+        "vol_lookback":  20,     # days used to compute average OR volume
+        "min_rr_ratio":  MIN_RR_RATIO,
+    },
+    "mean_reversion": {
+        "move_pct":       0.02,  # % move from day open that triggers fade
+        "rsi_period":     14,
+        "rsi_oversold":   25,
+        "rsi_overbought": 75,
+        "retrace_frac":   0.5,   # target = 50% retrace of move back to day open
+        "min_rr_ratio":   MIN_RR_RATIO,
+    },
+}
+
+# ── News filter (Phase 5) ─────────────────────────────────────────────────────
+# Maps Upstox instrument key → NSE symbol code for corporate action lookup
+SYMBOL_TO_NSE_CODE   = {
+    "NSE_EQ|INE009A01021": "INFY",
+    "NSE_EQ|INE002A01018": "RELIANCE",
+}
+# Dates where mean-reversion is blocked regardless of news filter (budget, RBI, expiry)
+NEWS_BLACKOUT_DATES  = [
+    # "2026-02-01",  # Union Budget
+]
+
+# ── Backtest cost model (Indian intraday equity) ───────────────────────────────
+BROKERAGE_FLAT       = 20.0          # ₹ per order (Zerodha-style flat fee)
+BROKERAGE_PCT        = 0.0005        # 0.05% — whichever is lower applies
+STT_PCT              = 0.00025       # 0.025% on sell side only
+EXCHANGE_TXN_PCT     = 0.0000297     # NSE transaction charge both legs
+SEBI_CHARGE_PCT      = 0.000001      # ₹10 per crore
+STAMP_DUTY_PCT       = 0.00003       # 0.003% on buy side
+GST_PCT              = 0.18          # 18% GST on (brokerage + exchange charges)
+SLIPPAGE_BPS         = 5             # slippage in basis points each way
+
 # ── Mode ──────────────────────────────────────────────────────────────────────
 PAPER_TRADING        = True         # flip to False to go live with real orders

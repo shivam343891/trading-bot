@@ -2,24 +2,29 @@
 SQLite trade journal.
 
 Schema (trades table):
-  id            INTEGER PRIMARY KEY
-  symbol        TEXT
-  side          TEXT          (BUY / SELL)
-  qty           INTEGER
-  entry_price   REAL
-  exit_price    REAL
-  sl            REAL
-  target        REAL
-  entry_time    TEXT          (ISO-8601)
-  exit_time     TEXT
-  pnl           REAL
-  exit_reason   TEXT          (target_hit | sl_hit | eod_flatten | manual)
+  id              INTEGER PRIMARY KEY
+  symbol          TEXT
+  side            TEXT          (BUY / SELL)
+  qty             INTEGER
+  entry_price     REAL
+  exit_price      REAL
+  sl              REAL
+  target          REAL
+  entry_time      TEXT          (ISO-8601)
+  exit_time       TEXT
+  pnl             REAL
+  exit_reason     TEXT          (target_hit | sl_hit | eod_flatten | manual)
+  strategy_name   TEXT
+
+bot_state table stores daily runtime state for crash recovery.
 """
 import csv
+import json
 import logging
 import sqlite3
 from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -38,18 +43,33 @@ class TradeLog:
         with self._conn() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trades (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol      TEXT    NOT NULL,
-                    side        TEXT    NOT NULL,
-                    qty         INTEGER NOT NULL,
-                    entry_price REAL    NOT NULL,
-                    exit_price  REAL,
-                    sl          REAL    NOT NULL,
-                    target      REAL    NOT NULL,
-                    entry_time  TEXT    NOT NULL,
-                    exit_time   TEXT,
-                    pnl         REAL,
-                    exit_reason TEXT
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol          TEXT    NOT NULL,
+                    side            TEXT    NOT NULL,
+                    qty             INTEGER NOT NULL,
+                    entry_price     REAL    NOT NULL,
+                    exit_price      REAL,
+                    sl              REAL    NOT NULL,
+                    target          REAL    NOT NULL,
+                    entry_time      TEXT    NOT NULL,
+                    exit_time       TEXT,
+                    pnl             REAL,
+                    exit_reason     TEXT,
+                    strategy_name   TEXT
+                )
+            """)
+            # Add strategy_name to existing DBs that predate this column
+            try:
+                conn.execute("ALTER TABLE trades ADD COLUMN strategy_name TEXT")
+                logger.info("Migrated trades table: added strategy_name column")
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key     TEXT PRIMARY KEY,
+                    value   TEXT NOT NULL,
+                    updated TEXT NOT NULL
                 )
             """)
 
@@ -67,16 +87,19 @@ class TradeLog:
         sl: float,
         target: float,
         entry_time: datetime,
+        strategy_name: str = "",
     ) -> int:
         with self._conn() as conn:
             cur = conn.execute(
                 """INSERT INTO trades
-                   (symbol, side, qty, entry_price, sl, target, entry_time)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (symbol, side, qty, entry_price, sl, target, entry_time.isoformat()),
+                   (symbol, side, qty, entry_price, sl, target, entry_time, strategy_name)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (symbol, side, qty, entry_price, sl, target,
+                 entry_time.isoformat(), strategy_name),
             )
             trade_id = cur.lastrowid
-        logger.debug("Trade inserted id=%d  %s %s qty=%d @%.2f", trade_id, side, symbol, qty, entry_price)
+        logger.debug("Trade inserted id=%d  %s %s qty=%d @%.2f [%s]",
+                     trade_id, side, symbol, qty, entry_price, strategy_name)
         return trade_id
 
     def update_exit(
@@ -113,6 +136,28 @@ class TradeLog:
             rows = conn.execute("SELECT * FROM trades ORDER BY id").fetchall()
         return [dict(r) for r in rows]
 
+    # ── Bot state persistence (crash recovery) ────────────────────────────────
+
+    def save_state(self, key: str, value: Any) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO bot_state (key, value, updated) VALUES (?, ?, ?)",
+                (key, json.dumps(value), datetime.now().isoformat()),
+            )
+
+    def load_state(self, key: str) -> Any | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT value, updated FROM bot_state WHERE key=?", (key,)
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+
+    def clear_state(self, key: str) -> None:
+        with self._conn() as conn:
+            conn.execute("DELETE FROM bot_state WHERE key=?", (key,))
+
     # ── Export ────────────────────────────────────────────────────────────────
 
     def export_csv(self, export_date: date | None = None) -> str:
@@ -125,9 +170,10 @@ class TradeLog:
             return str(filepath)
 
         fieldnames = ["id", "symbol", "side", "qty", "entry_price", "exit_price",
-                      "sl", "target", "entry_time", "exit_time", "pnl", "exit_reason"]
+                      "sl", "target", "entry_time", "exit_time", "pnl", "exit_reason",
+                      "strategy_name"]
         with open(filepath, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
 

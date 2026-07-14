@@ -1,78 +1,29 @@
 """
-Market data feed.
+Market data feed (hardened v2).
 
-Startup:
-  1. Fetches historical OHLCV via Upstox REST API to pre-warm candle buffers.
-  2. Connects MarketDataStreamer (WebSocket v3) for live tick aggregation.
-
-get_candles(symbol, tf) returns a pd.DataFrame of completed OHLCV candles
-for the requested timeframe (5-min or 15-min).
+Changes from v1:
+- Auto-reconnect with exponential backoff + gap-fill via REST after reconnect
+- Ticks bucketed by exchange timestamp inside payload, not local clock
+- Candles marked synthetic=True when gap-filled; signals never use synthetic candles
+- Zero-volume candle guard (VWAP/avg-vol calculations skip them)
 """
+from __future__ import annotations
+
 import logging
 import threading
-from collections import defaultdict
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
 import upstox_client
-from upstox_client import MarketDataStreamer
+from upstox_client import MarketDataStreamerV3 as MarketDataStreamer
+
+from data.candle_buffer import CandleBuffer as _CandleBuffer  # re-export for backwards compat
 
 logger = logging.getLogger(__name__)
 
-# OHLCV column names as returned by Upstox historical API
-_HIST_COLS = ["timestamp", "open", "high", "low", "close", "volume", "oi"]
-
-
-class _CandleBuffer:
-    """Thread-safe OHLCV candle accumulator for one symbol + timeframe."""
-
-    def __init__(self, tf_minutes: int) -> None:
-        self.tf = tf_minutes
-        self._lock = threading.Lock()
-        self._completed: list[dict] = []          # finished candles
-        self._current: dict | None = None         # candle being built
-
-    def on_tick(self, ltp: float, volume: int, high: float, low: float, ts: datetime) -> None:
-        bucket = self._bucket(ts)
-        with self._lock:
-            if self._current is None or self._current["timestamp"] != bucket:
-                if self._current is not None:
-                    self._completed.append(dict(self._current))
-                self._current = {
-                    "timestamp": bucket,
-                    "open": ltp,
-                    "high": high,
-                    "low": low,
-                    "close": ltp,
-                    "volume": volume,
-                }
-            else:
-                c = self._current
-                c["high"] = max(c["high"], high)
-                c["low"] = min(c["low"], low)
-                c["close"] = ltp
-                c["volume"] = volume   # Upstox sends cumulative volume
-
-    def _bucket(self, ts: datetime) -> datetime:
-        """Floor timestamp to the nearest tf-minute boundary."""
-        minute = (ts.minute // self.tf) * self.tf
-        return ts.replace(minute=minute, second=0, microsecond=0)
-
-    def seed(self, rows: list[dict]) -> None:
-        """Pre-load historical candles (already completed)."""
-        with self._lock:
-            self._completed = rows
-
-    def to_dataframe(self) -> pd.DataFrame:
-        with self._lock:
-            rows = list(self._completed)
-        if not rows:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df = pd.DataFrame(rows)
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df = df.sort_values("timestamp").reset_index(drop=True)
-        return df
+_MAX_RECONNECT_WAIT = 60   # seconds cap for backoff
 
 
 class DataFeed:
@@ -91,7 +42,6 @@ class DataFeed:
         self._prewarm_days = prewarm_days
         self._history_api = upstox_client.HistoryApi(api_client)
 
-        # buffers[(symbol, tf)] = _CandleBuffer
         self._buffers: dict[tuple[str, int], _CandleBuffer] = {}
         for sym in symbols:
             self._buffers[(sym, candle_tf)] = _CandleBuffer(candle_tf)
@@ -99,6 +49,9 @@ class DataFeed:
 
         self._streamer: MarketDataStreamer | None = None
         self._stream_thread: threading.Thread | None = None
+        self._reconnect_thread: threading.Thread | None = None
+        self._connected = threading.Event()
+        self._stop = threading.Event()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -108,6 +61,7 @@ class DataFeed:
         logger.info("DataFeed started — subscribed to %d symbols", len(self._symbols))
 
     def stop(self) -> None:
+        self._stop.set()
         if self._streamer:
             try:
                 self._streamer.disconnect()
@@ -122,11 +76,17 @@ class DataFeed:
         return buf.to_dataframe()
 
     def get_ltp(self, symbol: str) -> float | None:
-        """Return latest close price from the fast candle buffer."""
         df = self.get_candles(symbol, self._tf_fast)
         if df.empty:
             return None
         return float(df.iloc[-1]["close"])
+
+    def get_candles_for_signal(self, symbol: str, tf: int = 5) -> pd.DataFrame:
+        """Like get_candles but filters out synthetic candles for signal generation."""
+        df = self.get_candles(symbol, tf)
+        if df.empty:
+            return df
+        return df[~df["synthetic"].fillna(False)].reset_index(drop=True)
 
     # ── Historical pre-warm ───────────────────────────────────────────────────
 
@@ -134,7 +94,9 @@ class DataFeed:
         today = datetime.now(timezone.utc)
         from_date = (today - timedelta(days=self._prewarm_days)).strftime("%Y-%m-%d")
         to_date = today.strftime("%Y-%m-%d")
+        self._fetch_historical(from_date, to_date)
 
+    def _fetch_historical(self, from_date: str, to_date: str) -> None:
         for sym in self._symbols:
             for tf in (self._tf_fast, self._tf_slow):
                 try:
@@ -149,24 +111,109 @@ class DataFeed:
                     candles = resp.data.candles if resp.data else []
                     rows = []
                     for c in candles:
-                        # Upstox returns [timestamp, open, high, low, close, volume, oi]
+                        vol = int(c[5])
+                        if vol == 0:
+                            continue  # skip zero-volume candles for indicator inputs
                         rows.append({
-                            "timestamp": pd.to_datetime(c[0]),
+                            "timestamp": pd.to_datetime(c[0]).to_pydatetime(),
                             "open": float(c[1]),
                             "high": float(c[2]),
                             "low": float(c[3]),
                             "close": float(c[4]),
-                            "volume": int(c[5]),
+                            "volume": vol,
+                            "synthetic": False,
                         })
                     self._buffers[(sym, tf)].seed(rows)
-                    logger.info("Pre-warmed %s tf=%dmin with %d candles", sym, tf, len(rows))
+                    logger.info("Pre-warmed %s tf=%dmin  %d candles", sym, tf, len(rows))
                 except Exception as exc:
                     logger.warning("Pre-warm failed for %s tf=%d: %s", sym, tf, exc)
 
-    # ── WebSocket ─────────────────────────────────────────────────────────────
+    # ── Gap fill after reconnect ──────────────────────────────────────────────
+
+    def _gap_fill(self) -> None:
+        """Fetch missed candles from REST after a WebSocket disconnect."""
+        now = datetime.now(timezone.utc)
+        from_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        to_date = now.strftime("%Y-%m-%d")
+        gap_count = 0
+        for sym in self._symbols:
+            for tf in (self._tf_fast, self._tf_slow):
+                buf = self._buffers[(sym, tf)]
+                last_ts = buf.last_completed_ts()
+                try:
+                    resp = self._history_api.get_historical_candle_data1(
+                        instrument_key=sym,
+                        unit="minutes",
+                        interval=str(tf),
+                        to_date=to_date,
+                        from_date=from_date,
+                        api_version="2.0",
+                    )
+                    candles = resp.data.candles if resp.data else []
+                    rows = []
+                    for c in candles:
+                        ts = pd.to_datetime(c[0]).to_pydatetime()
+                        if last_ts and ts <= last_ts:
+                            continue  # already have this
+                        vol = int(c[5])
+                        rows.append({
+                            "timestamp": ts,
+                            "open": float(c[1]),
+                            "high": float(c[2]),
+                            "low": float(c[3]),
+                            "close": float(c[4]),
+                            "volume": vol,
+                            "synthetic": True,  # gap-filled
+                        })
+                    buf.seed(rows)
+                    gap_count += len(rows)
+                except Exception as exc:
+                    logger.warning("Gap fill failed for %s tf=%d: %s", sym, tf, exc)
+
+        logger.info("Gap fill complete — %d synthetic candles added", gap_count)
+        return gap_count
+
+    # ── WebSocket connection + reconnect ─────────────────────────────────────
 
     def _connect_websocket(self) -> None:
-        streamer = MarketDataStreamer(self._api_client, "full")
+        self._reconnect_thread = threading.Thread(
+            target=self._reconnect_loop, daemon=True, name="ws-reconnect"
+        )
+        self._reconnect_thread.start()
+
+    def _reconnect_loop(self) -> None:
+        backoff = 2
+        while not self._stop.is_set():
+            try:
+                self._connected.clear()
+                self._start_streamer()
+                self._connected.wait(timeout=30)
+                if self._connected.is_set():
+                    backoff = 2  # reset on successful connect
+                    # Block until disconnect (streamer thread exits)
+                    if self._stream_thread:
+                        self._stream_thread.join()
+                if self._stop.is_set():
+                    break
+                logger.warning("WebSocket disconnected — attempting gap fill then reconnect in %ds", backoff)
+                try:
+                    count = self._gap_fill()
+                    logger.info("FEED_RECONNECTED gap_filled=%d", count)
+                except Exception as exc:
+                    logger.warning("Gap fill error: %s", exc)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_RECONNECT_WAIT)
+            except Exception as exc:
+                logger.error("Reconnect loop error: %s", exc)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_RECONNECT_WAIT)
+
+    def _start_streamer(self) -> None:
+        streamer = MarketDataStreamer(
+            api_client=self._api_client,
+            instrumentKeys=self._symbols,
+            mode="full",
+        )
 
         def on_message(message: Any) -> None:
             try:
@@ -177,13 +224,22 @@ class DataFeed:
                     ff = feed_data.get("ff", {})
                     market_ff = ff.get("marketFF", {})
                     ltpc = market_ff.get("ltpc", {})
-                    ohlc = market_ff.get("marketOHLC", {}).get("ohlc", [{}])
+                    ohlc_list = market_ff.get("marketOHLC", {}).get("ohlc", [{}])
 
                     ltp = float(ltpc.get("ltp", 0))
                     volume = int(market_ff.get("tv", 0))
-                    high = float(ohlc[0].get("high", ltp)) if ohlc else ltp
-                    low = float(ohlc[0].get("low", ltp)) if ohlc else ltp
-                    ts = datetime.now()
+                    high = float(ohlc_list[0].get("high", ltp)) if ohlc_list else ltp
+                    low = float(ohlc_list[0].get("low", ltp)) if ohlc_list else ltp
+
+                    # Use exchange timestamp from payload if available
+                    raw_ts = ltpc.get("ltt") or ltpc.get("cp")  # last trade time
+                    if raw_ts:
+                        try:
+                            ts = datetime.fromtimestamp(int(raw_ts) / 1000)
+                        except Exception:
+                            ts = datetime.now()
+                    else:
+                        ts = datetime.now()
 
                     for tf in (self._tf_fast, self._tf_slow):
                         buf = self._buffers.get((sym, tf))
@@ -193,11 +249,11 @@ class DataFeed:
                 logger.debug("Tick parse error: %s", exc)
 
         def on_open() -> None:
-            streamer.subscribe(self._symbols, "full")
+            self._connected.set()
             logger.info("WebSocket connected and subscribed")
 
         def on_close() -> None:
-            logger.warning("WebSocket disconnected")
+            logger.warning("WebSocket closed")
 
         def on_error(err: Any) -> None:
             logger.error("WebSocket error: %s", err)
@@ -208,5 +264,5 @@ class DataFeed:
         streamer.on("error", on_error)
 
         self._streamer = streamer
-        self._stream_thread = threading.Thread(target=streamer.connect, daemon=True)
+        self._stream_thread = threading.Thread(target=streamer.connect, daemon=True, name="ws-stream")
         self._stream_thread.start()

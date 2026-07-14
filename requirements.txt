@@ -1,7 +1,10 @@
 upstox-python-sdk>=2.9.0
 pandas>=2.2.0
-pandas_ta>=0.3.14b
 python-telegram-bot>=21.0
 streamlit>=1.35.0
 schedule>=1.2.0
 requests>=2.31.0
+pyarrow>=16.0.0          # Parquet support for backtest data store
+pyotp>=2.9.0             # TOTP for automated login (Phase 3)
+playwright>=1.44.0       # browser automation for auth (Phase 3)
+python-dotenv>=1.0.0     # .env file support

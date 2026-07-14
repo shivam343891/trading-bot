@@ -120,6 +120,27 @@ class Notifier:
                 f"Best: {best} | Worst: {worst}"
             )
 
+        if event == "AUTH_FAILED":
+            return f"🔐 AUTH FAILED\n{p.get('message', '')}"
+
+        if event == "FEED_RECONNECTED":
+            return f"🔄 Feed reconnected — gap-filled {p.get('gap_count', 0)} candles"
+
+        if event == "STATE_RESTORED":
+            return (
+                f"♻️ State restored after restart\n"
+                f"Daily P&L: ₹{p.get('daily_pnl', 0):.0f} | "
+                f"Open positions: {p.get('open_count', 0)} | "
+                f"Halted: {p.get('halted', False)}"
+            )
+
+        if event == "FLATTEN_FAILED":
+            syms = ", ".join(p.get("symbols", []))
+            return f"🚨 EOD FLATTEN FAILED for {syms} — MANUAL ACTION REQUIRED"
+
+        if event in ("ORDER_ERROR", "LOOP_ERROR"):
+            return f"⚠️ Bot error [{event}]: {p.get('error', '')}"
+
         return ""
 
     # ── Transport ─────────────────────────────────────────────────────────────
