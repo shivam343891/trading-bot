@@ -5,7 +5,7 @@ UPSTOX_REDIRECT_URI  = "http://localhost:8000/callback"
 UPSTOX_TOKEN_FILE    = "token.json"
 
 # ── Capital & risk ────────────────────────────────────────────────────────────
-CAPITAL              = 100_000       # total capital in ₹
+CAPITAL              = 100_000       # total capital in ₹ (paper trades at this notional)
 DAILY_LOSS_LIMIT     = 2_000        # halt if daily P&L hits -₹2000
 MAX_RISK_PER_TRADE   = 0.01         # 1% of capital per trade
 MIN_RR_RATIO         = 1.5          # minimum risk:reward ratio to enter
@@ -17,12 +17,34 @@ MARKET_OPEN          = "09:30"      # skip 09:15–09:30 opening noise
 MARKET_CLOSE         = "15:15"      # flatten all positions at this time
 LOOP_INTERVAL_SECS   = 30           # main loop polling interval
 
-# ── Symbols (Upstox instrument key format) ────────────────────────────────────
+# ── Symbol universe ───────────────────────────────────────────────────────────
+# Nifty-50-grade liquidity. ISINs sourced from Upstox master contract file.
+# Roadmap: keep universe small (~10) to limit feed load + multiple-testing bias.
+# Expansion is a config change, not a code change.
 SYMBOLS = [
-    "NSE_EQ|INE009A01021",   # INFOSYS
+    "NSE_EQ|INE040A01034",   # HDFCBANK
+    "NSE_EQ|INE090A01021",   # ICICIBANK
+    "NSE_EQ|INE062A01020",   # SBIN
+    "NSE_EQ|INE009A01021",   # INFY
+    "NSE_EQ|INE467B01029",   # TCS
     "NSE_EQ|INE002A01018",   # RELIANCE
-    # "NSE_INDEX|Nifty 50",  # index — add when supported by your account
+    "NSE_EQ|INE155A01022",   # TATAMOTORS
+    "NSE_EQ|INE296A01024",   # BAJFINANCE
+    "NSE_EQ|INE423A01024",   # ADANIENT
 ]
+
+# Maps Upstox instrument key → NSE ticker (for news filter + reporting)
+SYMBOL_TO_NSE_CODE = {
+    "NSE_EQ|INE040A01034": "HDFCBANK",
+    "NSE_EQ|INE090A01021": "ICICIBANK",
+    "NSE_EQ|INE062A01020": "SBIN",
+    "NSE_EQ|INE009A01021": "INFY",
+    "NSE_EQ|INE467B01029": "TCS",
+    "NSE_EQ|INE002A01018": "RELIANCE",
+    "NSE_EQ|INE155A01022": "TATAMOTORS",
+    "NSE_EQ|INE296A01024": "BAJFINANCE",
+    "NSE_EQ|INE423A01024": "ADANIENT",
+}
 
 # ── Indicators ────────────────────────────────────────────────────────────────
 EMA_FAST             = 9
@@ -52,8 +74,26 @@ SMTP_PORT            = 465
 TRADE_DB_PATH        = "storage/trades.db"
 LOGS_DIR             = "logs"
 
-# ── Strategy selection ────────────────────────────────────────────────────────
-ACTIVE_STRATEGIES    = ["ema_vwap_rsi"]   # strategies that run in paper/live mode
+# ── Strategy selection (per-strategy symbol lists) ────────────────────────────
+# Each strategy runs only on its listed symbols. Use "all" to apply to every
+# symbol in SYMBOLS. Strategies that fail Stage-1 backtesting are disabled
+# here, not deleted.
+#
+# Roadmap symbol specialisation:
+#   ORB:            index-sensitive / gap-prone (banks, INFY, TCS, RELIANCE)
+#   mean_reversion: high-beta names only (TATAMOTORS, BAJFINANCE, ADANIENT)
+#   ema_vwap_rsi:   all liquid names
+ACTIVE_STRATEGIES = {
+    "ema_vwap_rsi":   "all",
+    "orb":            ["NSE_EQ|INE009A01021",   # INFY
+                       "NSE_EQ|INE467B01029",   # TCS
+                       "NSE_EQ|INE002A01018",   # RELIANCE
+                       "NSE_EQ|INE040A01034",   # HDFCBANK
+                       "NSE_EQ|INE090A01021"],  # ICICIBANK
+    "mean_reversion": ["NSE_EQ|INE155A01022",   # TATAMOTORS
+                       "NSE_EQ|INE296A01024",   # BAJFINANCE
+                       "NSE_EQ|INE423A01024"],  # ADANIENT
+}
 
 STRATEGY_PARAMS = {
     "ema_vwap_rsi": {
@@ -85,12 +125,7 @@ STRATEGY_PARAMS = {
     },
 }
 
-# ── News filter (Phase 5) ─────────────────────────────────────────────────────
-# Maps Upstox instrument key → NSE symbol code for corporate action lookup
-SYMBOL_TO_NSE_CODE   = {
-    "NSE_EQ|INE009A01021": "INFY",
-    "NSE_EQ|INE002A01018": "RELIANCE",
-}
+# ── News filter blackout dates ────────────────────────────────────────────────
 # Dates where mean-reversion is blocked regardless of news filter (budget, RBI, expiry)
 NEWS_BLACKOUT_DATES  = [
     # "2026-02-01",  # Union Budget
@@ -105,6 +140,12 @@ SEBI_CHARGE_PCT      = 0.000001      # ₹10 per crore
 STAMP_DUTY_PCT       = 0.00003       # 0.003% on buy side
 GST_PCT              = 0.18          # 18% GST on (brokerage + exchange charges)
 SLIPPAGE_BPS         = 5             # slippage in basis points each way
+
+# ── Stage gate criteria (roadmap) ─────────────────────────────────────────────
+# Used by backtest/report.py to emit pass/fail verdicts.
+GATE_MIN_TRADES      = 60            # minimum trades in full period to be valid
+GATE_MAX_DRAWDOWN_PCT = 0.15         # max drawdown must be < 15% of capital
+# OOS expectancy > 0 AND >= 50% of in-sample expectancy — checked in report.py
 
 # ── Mode ──────────────────────────────────────────────────────────────────────
 PAPER_TRADING        = True         # flip to False to go live with real orders

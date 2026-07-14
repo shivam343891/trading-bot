@@ -65,13 +65,39 @@ def _build_eod_summary(trade_log) -> dict:
         sign = "+" if pnl >= 0 else ""
         return f"{sym} {sign}₹{pnl:.0f}"
 
+    expectancy = net_pnl / len(closed) if closed else 0.0
+
+    # Paper-vs-backtest expectancy for today — auto-detect backtest CSVs
+    bt_expectancy_by_strategy: dict[str, float] = {}
+    today_str = date.today().isoformat()
+    try:
+        import csv as _csv
+        from pathlib import Path as _Path
+        for p in _Path(config.LOGS_DIR).glob("backtest_*.csv"):
+            strat = p.stem.replace("backtest_", "")
+            day_pnls = []
+            with open(p, newline="", encoding="utf-8") as f:
+                for row in _csv.DictReader(f):
+                    et = row.get("entry_time", "")
+                    if et.startswith(today_str):
+                        try:
+                            day_pnls.append(float(row.get("pnl", 0)))
+                        except (ValueError, TypeError):
+                            pass
+            if day_pnls:
+                bt_expectancy_by_strategy[strat] = sum(day_pnls) / len(day_pnls)
+    except Exception:
+        pass
+
     return {
         "trades": len(closed),
         "wins": len(wins),
         "losses": len(losses),
         "net_pnl": net_pnl,
+        "expectancy": expectancy,
         "best": _label(best_trade),
         "worst": _label(worst_trade),
+        "bt_expectancy": bt_expectancy_by_strategy,
     }
 
 
@@ -142,8 +168,20 @@ def _run_eod(broker, feed, risk, trade_log, notifier) -> None:
     trade_log.export_csv(date.today())
     trade_log.clear_state("positions")
     trade_log.clear_state("daily_pnl")
+
+    # Log paper-vs-backtest for today (Stage-2 health check)
+    if summary.get("bt_expectancy"):
+        paper_exp = summary["expectancy"]
+        logger.info("EOD paper-vs-backtest expectancy comparison:")
+        for strat, bt_exp in summary["bt_expectancy"].items():
+            ratio = (paper_exp / bt_exp * 100) if bt_exp != 0 else float("nan")
+            flag = " ⚠️ <50% ratio" if ratio < 50 else ""
+            logger.info("  %s  paper ₹%.2f  backtest ₹%.2f  ratio %.0f%%%s",
+                        strat, paper_exp, bt_exp, ratio, flag)
+
     feed.stop()
-    logger.info("EOD complete. Net P&L: ₹%.2f", summary["net_pnl"])
+    logger.info("EOD complete. Net P&L: ₹%.2f  expectancy ₹%.2f",
+                summary["net_pnl"], summary["expectancy"])
 
 
 def _critical_alert_loop(syms: list[str], notifier, max_alerts: int = 10) -> None:
@@ -275,8 +313,11 @@ def main() -> None:
 
     # ── Phase 1: strategy registry ────────────────────────────────────────────
     from strategy.registry import build_strategies
-    strategies = build_strategies(config.ACTIVE_STRATEGIES, config.STRATEGY_PARAMS)
-    logger.info("Active strategies: %s", [s.name for s in strategies])
+    strategy_pairs = build_strategies(
+        config.ACTIVE_STRATEGIES, config.STRATEGY_PARAMS, config.SYMBOLS
+    )
+    logger.info("Active strategies: %s",
+                {s.name: syms for s, syms in strategy_pairs})
 
     # ── 3. Data feed ──────────────────────────────────────────────────────────
     api_client = _build_upstox_api_client()
@@ -379,45 +420,45 @@ def main() -> None:
                 prev_rows = df[df["timestamp"].dt.date < now.date()]
                 prev_closes[sym] = float(prev_rows.iloc[-1]["close"]) if not prev_rows.empty else 0.0
 
-            # Signal scan — run every active strategy on every symbol
-            for sym in config.SYMBOLS:
-                candles_5m = feed.get_candles(sym, config.CANDLE_TF)
-                candles_15m = feed.get_candles(sym, config.CANDLE_TF_SLOW)
-
-                if candles_5m.empty or candles_15m.empty:
-                    continue
-
-                has_news = False
-                if news_filter:
-                    has_news = news_filter.has_news(sym)
-
-                from strategy.base import MarketContext
-                ctx = MarketContext(
-                    symbol=sym,
-                    current_time=now,
-                    open_position=sym in open_positions,
-                    day_open=day_opens.get(sym, 0.0),
-                    prev_day_close=prev_closes.get(sym, 0.0),
-                    has_news_today=has_news,
-                )
-
-                for strategy in strategies:
-                    # Signal dedup: skip if we already processed this candle close
-                    last_candle_ts = candles_5m.iloc[-1]["timestamp"] if not candles_5m.empty else None
-                    dedup_key = (sym, strategy.name)
-                    if last_candle_ts is not None:
-                        if last_processed.get(dedup_key) == last_candle_ts:
-                            continue
-                    if ctx.open_position:
+            # Signal scan — each strategy runs only on its configured symbols
+            from strategy.base import MarketContext
+            for strategy, strat_symbols in strategy_pairs:
+                for sym in strat_symbols:
+                    if sym not in config.SYMBOLS:
                         continue
+
+                    candles_5m = feed.get_candles_for_signal(sym, config.CANDLE_TF)
+                    candles_15m = feed.get_candles_for_signal(sym, config.CANDLE_TF_SLOW)
+
+                    if candles_5m.empty or candles_15m.empty:
+                        continue
+
+                    last_candle_ts = candles_5m.iloc[-1]["timestamp"]
+                    dedup_key = (sym, strategy.name)
+                    if last_processed.get(dedup_key) == last_candle_ts:
+                        continue
+
+                    if sym in open_positions:
+                        last_processed[dedup_key] = last_candle_ts
+                        continue
+
+                    has_news = news_filter.has_news(sym) if news_filter else False
+
+                    ctx = MarketContext(
+                        symbol=sym,
+                        current_time=now,
+                        open_position=False,
+                        day_open=day_opens.get(sym, 0.0),
+                        prev_day_close=prev_closes.get(sym, 0.0),
+                        has_news_today=has_news,
+                    )
 
                     try:
                         sig = strategy.generate_signal(candles_5m, candles_15m, ctx)
                     except Exception as exc:
                         logger.error("Strategy %s error on %s: %s", strategy.name, sym, exc)
                         continue
-
-                    if last_candle_ts is not None:
+                    finally:
                         last_processed[dedup_key] = last_candle_ts
 
                     if sig is None:
@@ -463,15 +504,8 @@ def main() -> None:
                             "qty": qty,
                             "strategy_name": strategy.name,
                         })
-                        # Update ctx so no second strategy enters same symbol this tick
-                        ctx = MarketContext(
-                            symbol=sym,
-                            current_time=now,
-                            open_position=True,
-                            day_open=ctx.day_open,
-                            prev_day_close=ctx.prev_day_close,
-                            has_news_today=ctx.has_news_today,
-                        )
+                        # Mark position open so no other strategy enters same symbol this tick
+                        open_positions[sym] = True
                     except Exception as exc:
                         logger.error("Order/log failed for %s %s: %s", strategy.name, sym, exc)
                         notifier.send("ORDER_ERROR", {"symbol": sym, "strategy": strategy.name, "error": str(exc)})

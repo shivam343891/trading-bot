@@ -49,7 +49,7 @@ class BacktestEngine:
     def __init__(
         self,
         strategy: Strategy,
-        symbols: list[str],
+        symbols: list[str],          # symbols this strategy is allowed to trade
         capital: float,
         max_risk_per_trade: float,
         daily_loss_limit: float,
