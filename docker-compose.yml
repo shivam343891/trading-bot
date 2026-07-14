@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  bot:
+    build: .
+    container_name: trading_bot
+    restart: unless-stopped
+    volumes:
+      - ./storage:/app/storage      # persist SQLite DB
+      - ./logs:/app/logs            # persist log files
+      - ./token.json:/app/token.json:ro  # mount OAuth token (read-only)
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python main.py
+
+  dashboard:
+    build: .
+    container_name: trading_dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./storage:/app/storage      # shared with bot
+      - ./logs:/app/logs
+    command: streamlit run dashboard/app.py --server.port=8501 --server.address=0.0.0.0
+    depends_on:
+      - bot
